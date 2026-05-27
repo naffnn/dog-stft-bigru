@@ -1,0 +1,14 @@
+torch
+torchaudio
+numpy
+pandas
+scikit-learn
+matplotlib
+tqdm
+soundfile
+librosa
+ssqueezepy
+transformers
+
+# Optional. The code automatically falls back to a GRU sequence encoder if unavailable.
+# mamba-ssm
