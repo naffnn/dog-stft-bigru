@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 import warnings
 from collections import Counter
 from pathlib import Path
@@ -26,6 +27,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out_dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--sample_rate", type=int, default=16000)
     parser.add_argument("--duration", type=float, default=4.0)
+    parser.add_argument(
+        "--skip_f0",
+        action="store_true",
+        help="Skip F0 extraction and fill all F0 columns with NaN.",
+    )
+    parser.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=100,
+        help="Save partial results every N processed audio files. Use <= 0 to disable.",
+    )
     return parser.parse_args()
 
 
@@ -96,10 +108,8 @@ def safe_max(values: np.ndarray) -> float:
     return float(np.max(finite))
 
 
-def estimate_f0(audio: np.ndarray, sample_rate: int) -> dict[str, float]:
-    import librosa
-
-    empty = {
+def empty_f0_features() -> dict[str, float]:
+    return {
         "f0_mean": math.nan,
         "f0_std": math.nan,
         "f0_min": math.nan,
@@ -107,9 +117,15 @@ def estimate_f0(audio: np.ndarray, sample_rate: int) -> dict[str, float]:
         "f0_range": math.nan,
         "f0_voiced_ratio": math.nan,
     }
+
+
+def estimate_f0(audio: np.ndarray, sample_rate: int) -> dict[str, float]:
+    import librosa
+
+    empty = empty_f0_features()
     try:
         fmax = min(2000.0, sample_rate / 2.0 - 1.0)
-        f0, voiced_flag, _ = librosa.pyin(
+        f0 = librosa.yin(
             audio,
             fmin=50.0,
             fmax=fmax,
@@ -117,8 +133,10 @@ def estimate_f0(audio: np.ndarray, sample_rate: int) -> dict[str, float]:
             frame_length=1024,
             hop_length=256,
         )
-        voiced = np.asarray(f0, dtype=float)[np.isfinite(f0)]
-        voiced_ratio = float(np.mean(voiced_flag)) if voiced_flag is not None and len(voiced_flag) else math.nan
+        f0 = np.asarray(f0, dtype=float)
+        voiced_mask = np.isfinite(f0) & (f0 > 0)
+        voiced = f0[voiced_mask]
+        voiced_ratio = float(np.mean(voiced_mask)) if f0.size else math.nan
         if voiced.size == 0:
             empty["f0_voiced_ratio"] = voiced_ratio
             return empty
@@ -153,7 +171,7 @@ def count_energy_peaks(rms: np.ndarray) -> int:
         return int(np.sum(peaks))
 
 
-def extract_features(path: Path, label: str, sample_rate: int, duration: float) -> dict[str, Any]:
+def extract_features(path: Path, label: str, sample_rate: int, duration: float, skip_f0: bool) -> dict[str, Any]:
     import librosa
 
     audio = load_audio(path, sample_rate, duration)
@@ -204,7 +222,10 @@ def extract_features(path: Path, label: str, sample_rate: int, duration: float) 
     for i in range(13):
         row[f"mfcc_{i + 1}_std"] = safe_std(mfcc[i])
 
-    row.update(estimate_f0(audio, sample_rate))
+    if skip_f0:
+        row.update(empty_f0_features())
+    else:
+        row.update(estimate_f0(audio, sample_rate))
     return row
 
 
@@ -226,26 +247,56 @@ def main() -> None:
     data_root = args.data_root
     out_dir = args.out_dir
     feature_dir = out_dir / "features"
+    report_dir = out_dir / "reports"
     feature_dir.mkdir(parents=True, exist_ok=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
 
     audio_files = iter_audio_files(data_root)
     rows: list[dict[str, Any]] = []
     failures: list[tuple[Path, str]] = []
+    total_files = len(audio_files)
+    partial_csv = feature_dir / "acoustic_features_4s_partial.csv"
 
     warnings.filterwarnings("ignore", category=UserWarning)
+    print("data_root:", data_root)
+    print("out_dir:", out_dir)
+    print("sample_rate:", args.sample_rate)
+    print("duration:", args.duration)
+    print("skip_f0:", args.skip_f0)
+    print("Total audio files found:", total_files)
 
+    started_at = time.perf_counter()
     for index, (path, label) in enumerate(audio_files, start=1):
         try:
-            rows.append(extract_features(path, label, args.sample_rate, args.duration))
+            rows.append(extract_features(path, label, args.sample_rate, args.duration, args.skip_f0))
         except Exception as exc:
             failures.append((path, str(exc)))
-            print(f"[{index}/{len(audio_files)}] Failed: {path} ({exc})")
+            print(f"[{index}/{total_files}] Failed: {path} ({exc})")
+
+        if index % 50 == 0 or index == total_files:
+            elapsed = time.perf_counter() - started_at
+            print(f"[{index}/{total_files}] processed, elapsed={elapsed:.1f} s, current={path.name}")
+
+        if args.checkpoint_every > 0 and index % args.checkpoint_every == 0:
+            pd.DataFrame(rows).to_csv(partial_csv, index=False, encoding="utf-8-sig")
+            print(f"Checkpoint saved: {partial_csv}")
 
     output_csv = feature_dir / "acoustic_features_4s.csv"
     pd.DataFrame(rows).to_csv(output_csv, index=False, encoding="utf-8-sig")
+    if rows:
+        pd.DataFrame(rows).to_csv(partial_csv, index=False, encoding="utf-8-sig")
+
+    failed_report = report_dir / "extraction_failed_files.txt"
+    if failures:
+        failed_report.write_text(
+            "\n".join(f"{failed_path}\t{reason}" for failed_path, reason in failures),
+            encoding="utf-8",
+        )
+    else:
+        failed_report.write_text("No failed files.\n", encoding="utf-8")
 
     label_counts = Counter(label for _, label in audio_files)
-    print("Total samples:", len(audio_files))
+    print("Total samples:", total_files)
     print("Samples per class:")
     for label in CLASS_NAMES:
         print(f"  {label}: {label_counts.get(label, 0)}")
@@ -256,6 +307,7 @@ def main() -> None:
             print(f"  {failed_path} | {reason}")
     else:
         print("  None")
+    print("Failed file report:", failed_report)
     print("Output csv:", output_csv)
 
 
