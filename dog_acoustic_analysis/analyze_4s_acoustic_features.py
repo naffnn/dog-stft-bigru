@@ -93,7 +93,7 @@ def run_kruskal_tests(df: pd.DataFrame, report_dir: Path) -> tuple[Path, pd.Data
                     "statistic": math.nan,
                     "p_value": math.nan,
                     "significant_p_lt_0_05": False,
-                    "note": "fewer than two valid class groups",
+                    "note": "not enough valid groups",
                 }
             )
             continue
@@ -121,7 +121,7 @@ def run_kruskal_tests(df: pd.DataFrame, report_dir: Path) -> tuple[Path, pd.Data
     return output, result
 
 
-def save_boxplots(df: pd.DataFrame, figure_dir: Path) -> list[Path]:
+def save_boxplots(df: pd.DataFrame, figure_dir: Path, report_dir: Path) -> list[Path]:
     import matplotlib.pyplot as plt
 
     try:
@@ -130,38 +130,79 @@ def save_boxplots(df: pd.DataFrame, figure_dir: Path) -> list[Path]:
         sns = None
 
     outputs: list[Path] = []
-    plot_df = df[df["label"].isin(CLASS_NAMES)].copy()
+    failures: list[str] = []
+    base_df = df[df["label"].isin(CLASS_NAMES)].copy()
     for feature in BOX_FEATURES:
-        if feature not in plot_df.columns:
+        if feature not in base_df.columns:
+            print(f"[SKIP] {feature} not found, skip boxplot.")
             continue
 
-        plt.figure(figsize=(8, 5), dpi=150)
-        if sns is not None:
-            sns.boxplot(data=plot_df, x="label", y=feature, order=CLASS_NAMES, color="#7aa6c2")
-            sns.stripplot(
-                data=plot_df,
-                x="label",
-                y=feature,
-                order=CLASS_NAMES,
-                color="#2f2f2f",
-                size=2,
-                alpha=0.35,
-            )
-        else:
-            plot_df.boxplot(column=feature, by="label", grid=False)
-            plt.suptitle("")
-        plt.title(f"{feature} by emotion class")
-        plt.xlabel("Emotion class")
-        plt.ylabel(feature)
-        plt.tight_layout()
-        output = figure_dir / f"box_{feature}.png"
-        plt.savefig(output)
-        plt.close()
-        outputs.append(output)
+        plot_df = base_df[["label", feature]].copy()
+        plot_df[feature] = pd.to_numeric(plot_df[feature], errors="coerce")
+        plot_df = plot_df.dropna(subset=[feature])
+
+        if plot_df.empty:
+            print(f"[SKIP] {feature} has no valid values, skip boxplot.")
+            continue
+
+        valid_labels = [label for label in CLASS_NAMES if (plot_df["label"] == label).any()]
+        if len(valid_labels) < 2:
+            print(f"[SKIP] {feature} has fewer than 2 valid classes, skip boxplot.")
+            continue
+
+        try:
+            plt.figure(figsize=(8, 5), dpi=150)
+            if sns is not None:
+                sns.boxplot(data=plot_df, x="label", y=feature, order=valid_labels, color="#7aa6c2")
+                sns.stripplot(
+                    data=plot_df,
+                    x="label",
+                    y=feature,
+                    order=valid_labels,
+                    color="#2f2f2f",
+                    size=2,
+                    alpha=0.35,
+                )
+            else:
+                grouped_values = [
+                    plot_df.loc[plot_df["label"] == label, feature].to_numpy()
+                    for label in valid_labels
+                ]
+                plt.boxplot(grouped_values, labels=valid_labels)
+                plt.suptitle("")
+            plt.title(f"{feature} by emotion class")
+            plt.xlabel("Emotion class")
+            plt.ylabel(feature)
+            plt.tight_layout()
+            output = figure_dir / f"box_{feature}.png"
+            plt.savefig(output)
+            outputs.append(output)
+        except Exception as exc:
+            failures.append(f"{feature}\t{exc}")
+            print(f"[WARN] {feature} boxplot failed: {exc}")
+        finally:
+            plt.close()
+
+    failed_path = report_dir / "plot_failed_features.txt"
+    if failures:
+        failed_path.write_text("\n".join(failures), encoding="utf-8")
+    else:
+        failed_path.write_text("No failed boxplots.\n", encoding="utf-8")
     return outputs
 
 
-def save_heatmap(df: pd.DataFrame, figure_dir: Path) -> Path:
+def valid_key_features(df: pd.DataFrame) -> list[str]:
+    features: list[str] = []
+    for feature in KRUSKAL_FEATURES:
+        if feature not in df.columns:
+            continue
+        values = pd.to_numeric(df[feature], errors="coerce")
+        if values.notna().any():
+            features.append(feature)
+    return features
+
+
+def save_heatmap(df: pd.DataFrame, figure_dir: Path) -> tuple[Path | None, str]:
     import matplotlib.pyplot as plt
 
     try:
@@ -169,16 +210,32 @@ def save_heatmap(df: pd.DataFrame, figure_dir: Path) -> Path:
     except Exception:
         sns = None
 
-    available = [feature for feature in KRUSKAL_FEATURES if feature in df.columns]
-    class_means = df.groupby("label")[available].mean(numeric_only=True).reindex(CLASS_NAMES)
-    zscore = class_means.copy()
+    available = valid_key_features(df)
+    if not available:
+        return None, "Heatmap skipped: no key feature had valid numeric values."
+
+    heatmap_df = df[df["label"].isin(CLASS_NAMES)].copy()
     for feature in available:
+        heatmap_df[feature] = pd.to_numeric(heatmap_df[feature], errors="coerce")
+
+    class_means = heatmap_df.groupby("label")[available].mean(numeric_only=True).reindex(CLASS_NAMES)
+    class_means = class_means.dropna(axis=1, how="all")
+    if class_means.empty or class_means.shape[1] == 0:
+        return None, "Heatmap skipped: class means were all NaN after filtering."
+
+    zscore = class_means.copy()
+    for feature in class_means.columns:
         mean = zscore[feature].mean(skipna=True)
         std = zscore[feature].std(skipna=True, ddof=0)
-        if not np.isfinite(std) or std == 0:
+        if not np.isfinite(mean):
+            zscore[feature] = np.nan
+        elif not np.isfinite(std) or std == 0:
             zscore[feature] = 0.0
         else:
             zscore[feature] = (zscore[feature] - mean) / std
+    zscore = zscore.dropna(axis=1, how="all")
+    if zscore.empty or zscore.shape[1] == 0:
+        return None, "Heatmap skipped: no usable z-scored feature remained."
 
     plt.figure(figsize=(12, 5.5), dpi=150)
     if sns is not None:
@@ -194,7 +251,7 @@ def save_heatmap(df: pd.DataFrame, figure_dir: Path) -> Path:
     else:
         image = plt.imshow(zscore.to_numpy(dtype=float), aspect="auto", cmap="coolwarm")
         plt.colorbar(image, label="Z-scored class mean")
-        plt.xticks(range(len(available)), available, rotation=45, ha="right")
+        plt.xticks(range(len(zscore.columns)), zscore.columns, rotation=45, ha="right")
         plt.yticks(range(len(CLASS_NAMES)), CLASS_NAMES)
     plt.title("Class-level acoustic feature mean heatmap")
     plt.xlabel("Acoustic feature")
@@ -203,20 +260,29 @@ def save_heatmap(df: pd.DataFrame, figure_dir: Path) -> Path:
     output = figure_dir / "class_feature_mean_heatmap.png"
     plt.savefig(output)
     plt.close()
-    return output
+    return output, ""
 
 
 def describe_class_patterns(df: pd.DataFrame) -> list[str]:
-    available = [feature for feature in KRUSKAL_FEATURES if feature in df.columns]
+    available = valid_key_features(df)
     if not available:
         return ["No key features were available for class pattern description."]
 
-    means = df.groupby("label")[available].mean(numeric_only=True).reindex(CLASS_NAMES)
-    zscore = means.copy()
+    df = df.copy()
     for feature in available:
+        df[feature] = pd.to_numeric(df[feature], errors="coerce")
+    means = df.groupby("label")[available].mean(numeric_only=True).reindex(CLASS_NAMES)
+    means = means.dropna(axis=1, how="all")
+    if means.empty or means.shape[1] == 0:
+        return ["No key features had usable class means for pattern description."]
+
+    zscore = means.copy()
+    for feature in means.columns:
         feature_mean = zscore[feature].mean(skipna=True)
         feature_std = zscore[feature].std(skipna=True, ddof=0)
-        if not np.isfinite(feature_std) or feature_std == 0:
+        if not np.isfinite(feature_mean):
+            zscore[feature] = np.nan
+        elif not np.isfinite(feature_std) or feature_std == 0:
             zscore[feature] = 0.0
         else:
             zscore[feature] = (zscore[feature] - feature_mean) / feature_std
@@ -226,6 +292,9 @@ def describe_class_patterns(df: pd.DataFrame) -> list[str]:
         if label not in zscore.index:
             continue
         row = zscore.loc[label].dropna()
+        if row.empty:
+            lines.append(f"- {label}: no valid key feature means available.")
+            continue
         high = row[row >= 0.5].sort_values(ascending=False).index.tolist()
         low = row[row <= -0.5].sort_values().index.tolist()
         if not high:
@@ -236,7 +305,20 @@ def describe_class_patterns(df: pd.DataFrame) -> list[str]:
     return lines
 
 
-def save_text_report(df: pd.DataFrame, kruskal_df: pd.DataFrame, report_dir: Path) -> Path:
+def f0_features_all_empty(df: pd.DataFrame) -> bool:
+    f0_features = ["f0_mean", "f0_std", "f0_min", "f0_max", "f0_range", "f0_voiced_ratio"]
+    present = [feature for feature in f0_features if feature in df.columns]
+    if not present:
+        return False
+    return all(pd.to_numeric(df[feature], errors="coerce").dropna().empty for feature in present)
+
+
+def save_text_report(
+    df: pd.DataFrame,
+    kruskal_df: pd.DataFrame,
+    report_dir: Path,
+    heatmap_note: str = "",
+) -> Path:
     significant = kruskal_df.loc[kruskal_df["significant_p_lt_0_05"], "feature"].tolist()
     output = report_dir / "analysis_summary.txt"
     lines = [
@@ -254,6 +336,24 @@ def save_text_report(df: pd.DataFrame, kruskal_df: pd.DataFrame, report_dir: Pat
             "",
             "Class-level mean patterns based on z-scored class means:",
             *describe_class_patterns(df),
+            "",
+            "Missing feature note:",
+        ]
+    )
+    if f0_features_all_empty(df):
+        lines.append(
+            "F0 features are all empty; this may happen when feature extraction was run with --skip_f0."
+        )
+    lines.extend(
+        [
+            "The current analysis can still use RMS, spectral, MFCC, onset, and other non-F0 acoustic features.",
+        ]
+    )
+    if heatmap_note:
+        lines.extend(["", heatmap_note])
+
+    lines.extend(
+        [
             "",
             "Interpretation note:",
             "These results describe statistical associations in the current dataset. They should not be interpreted as direct proof of true canine emotional mechanisms.",
@@ -276,14 +376,16 @@ def main() -> None:
 
     summary_path = save_feature_summary(df, report_dir)
     kruskal_path, kruskal_df = run_kruskal_tests(df, report_dir)
-    boxplot_paths = save_boxplots(df, figure_dir)
-    heatmap_path = save_heatmap(df, figure_dir)
-    report_path = save_text_report(df, kruskal_df, report_dir)
+    boxplot_paths = save_boxplots(df, figure_dir, report_dir)
+    heatmap_path, heatmap_note = save_heatmap(df, figure_dir)
+    if heatmap_note:
+        print("[SKIP]", heatmap_note)
+    report_path = save_text_report(df, kruskal_df, report_dir, heatmap_note)
 
     print("Feature summary:", summary_path)
     print("Kruskal-Wallis results:", kruskal_path)
     print("Boxplots:", len(boxplot_paths), "files saved to", figure_dir)
-    print("Heatmap:", heatmap_path)
+    print("Heatmap:", heatmap_path if heatmap_path is not None else "skipped")
     print("Text report:", report_path)
 
 
