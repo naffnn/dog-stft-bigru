@@ -126,3 +126,31 @@ E:\newdog_emo\dog_acoustic_analysis\figures\correct_vs_wrong_onset_rate.png
 - 本实验不是重新训练模型。
 - 本实验用于后续 bark / bout 分析和情绪声学特征解释。
 - 统计显著性只表示当前数据中的相关差异，不直接等于真实情绪机制。
+
+## Post-hoc and effect size analysis
+
+After `acoustic_features_4s.csv` has already been generated, run the post-hoc script to compute Kruskal-Wallis effect sizes, Dunn pairwise comparisons, feature rankings, and paper/report-ready tables.
+
+```powershell
+python posthoc_effect_analysis.py --feature_csv "E:\dog_stft_bigru_github\dog_acoustic_analysis\features\acoustic_features_4s.csv" --out_dir "E:\dog_stft_bigru_github\dog_acoustic_analysis"
+```
+
+This script does not modify original audio files and does not re-extract acoustic features. It analyzes the existing 4-second handcrafted feature CSV.
+
+Main outputs:
+
+```text
+reports\feature_effect_size_ranking.csv
+reports\dunn_posthoc_all_features_long.csv
+reports\feature_class_median_ranking.csv
+figures\feature_effect_size_ranking.png
+figures\dunn_<feature>_heatmap.png
+reports\posthoc_effect_analysis_summary.txt
+reports\posthoc_effect_failed_features.txt
+```
+
+The Dunn post-hoc step requires `scikit-posthocs`. If it is missing, install it with:
+
+```powershell
+pip install scikit-posthocs
+```
