@@ -30,10 +30,12 @@ BOX_FEATURES = [
     "log_energy",
     "spectral_centroid_mean",
     "spectral_bandwidth_mean",
+    "spectral_rolloff_mean",
     "f0_mean",
     "f0_std",
     "f0_range",
     "onset_rate_per_sec",
+    "onset_count",
     "energy_peak_count",
 ]
 
@@ -183,7 +185,7 @@ def save_boxplots(df: pd.DataFrame, figure_dir: Path, report_dir: Path) -> list[
         finally:
             plt.close()
 
-    failed_path = report_dir / "plot_failed_features.txt"
+    failed_path = report_dir / "boxplot_failed_features.txt"
     if failures:
         failed_path.write_text("\n".join(failures), encoding="utf-8")
     else:
@@ -318,6 +320,7 @@ def save_text_report(
     kruskal_df: pd.DataFrame,
     report_dir: Path,
     heatmap_note: str = "",
+    boxplot_filenames: list[str] | None = None,
 ) -> Path:
     significant = kruskal_df.loc[kruskal_df["significant_p_lt_0_05"], "feature"].tolist()
     output = report_dir / "analysis_summary.txt"
@@ -352,6 +355,15 @@ def save_text_report(
     if heatmap_note:
         lines.extend(["", heatmap_note])
 
+    if boxplot_filenames:
+        lines.extend(
+            [
+                "",
+                "Generated boxplot figures:",
+                *[f"  - {name}" for name in boxplot_filenames],
+            ]
+        )
+
     lines.extend(
         [
             "",
@@ -380,7 +392,8 @@ def main() -> None:
     heatmap_path, heatmap_note = save_heatmap(df, figure_dir)
     if heatmap_note:
         print("[SKIP]", heatmap_note)
-    report_path = save_text_report(df, kruskal_df, report_dir, heatmap_note)
+    boxplot_names = [p.name for p in boxplot_paths]
+    report_path = save_text_report(df, kruskal_df, report_dir, heatmap_note, boxplot_filenames=boxplot_names)
 
     print("Feature summary:", summary_path)
     print("Kruskal-Wallis results:", kruskal_path)

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -202,7 +202,9 @@ def save_correct_wrong_summary(merged: pd.DataFrame, report_dir: Path) -> Path:
     return output
 
 
-def save_correct_wrong_plots(merged: pd.DataFrame, figure_dir: Path) -> list[Path]:
+def save_correct_wrong_plots(merged: pd.DataFrame, figure_dir: Path, report_dir: Path) -> tuple[list[Path], list[str], list[str]]:
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     try:
@@ -212,44 +214,108 @@ def save_correct_wrong_plots(merged: pd.DataFrame, figure_dir: Path) -> list[Pat
 
     plot_specs = [
         ("rms_mean", "correct_vs_wrong_rms_mean.png"),
-        ("f0_mean", "correct_vs_wrong_f0_mean.png"),
-        ("spectral_centroid_mean", "correct_vs_wrong_spectral_centroid.png"),
-        ("onset_rate_per_sec", "correct_vs_wrong_onset_rate.png"),
+        ("log_energy", "correct_vs_wrong_log_energy.png"),
+        ("spectral_centroid_mean", "correct_vs_wrong_spectral_centroid_mean.png"),
+        ("spectral_bandwidth_mean", "correct_vs_wrong_spectral_bandwidth_mean.png"),
+        ("spectral_rolloff_mean", "correct_vs_wrong_spectral_rolloff_mean.png"),
+        ("onset_rate_per_sec", "correct_vs_wrong_onset_rate_per_sec.png"),
+        ("onset_count", "correct_vs_wrong_onset_count.png"),
+        ("energy_peak_count", "correct_vs_wrong_energy_peak_count.png"),
     ]
     outputs: list[Path] = []
-    plot_df = merged.dropna(subset=["correct"]).copy()
-    if plot_df.empty:
-        return outputs
-    plot_df["correct_group"] = plot_df["correct"].map({True: "correct", False: "wrong"})
+    failed_features: list[str] = []
+    skipped_features: list[str] = []
+
+    if "correct" not in merged.columns:
+        print("[WARN] No 'correct' column in merged data; skipping all plots.")
+        return outputs, failed_features, skipped_features
+
+    base_df = merged.dropna(subset=["correct"]).copy()
+    if base_df.empty:
+        print("[WARN] No rows with valid 'correct' values; skipping all plots.")
+        return outputs, failed_features, skipped_features
+    base_df["correct_group"] = base_df["correct"].map({True: "correct", False: "wrong"})
 
     for feature, filename in plot_specs:
-        if feature not in plot_df.columns:
+        print(f"  [PLOT] {feature}")
+        # --- per-feature validation ---
+        if feature not in merged.columns:
+            skipped_features.append(feature)
+            print(f"  [SKIP] {feature} not found in merged columns.")
             continue
-        plt.figure(figsize=(6.5, 4.5), dpi=150)
-        if sns is not None:
-            sns.boxplot(data=plot_df, x="correct_group", y=feature, order=["correct", "wrong"], color="#86a873")
-            sns.stripplot(
-                data=plot_df,
-                x="correct_group",
-                y=feature,
-                order=["correct", "wrong"],
-                color="#2f2f2f",
-                size=2,
-                alpha=0.35,
-            )
-        else:
-            plot_df.boxplot(column=feature, by="correct_group", grid=False)
-            plt.suptitle("")
-        plt.title(f"{feature}: correct vs wrong")
-        plt.xlabel("Prediction result")
-        plt.ylabel(feature)
-        plt.tight_layout()
-        output = figure_dir / filename
-        plt.savefig(output)
-        plt.close()
-        outputs.append(output)
-    return outputs
 
+        plot_df = base_df.copy()
+
+        # Convert to numeric, drop NaNs introduced by conversion
+        plot_df[feature] = pd.to_numeric(plot_df[feature], errors="coerce")
+        plot_df = plot_df.dropna(subset=[feature])
+
+        # Drop rows where correct_group is empty/NA
+        plot_df = plot_df.dropna(subset=["correct_group"])
+
+        # Keep only known groups
+        plot_df = plot_df[plot_df["correct_group"].isin(["correct", "wrong"])]
+
+        if plot_df.empty:
+            skipped_features.append(feature)
+            print(f"  [SKIP] {feature} has no valid values.")
+            continue
+
+        unique_groups = plot_df["correct_group"].unique()
+        if len(unique_groups) < 2:
+            skipped_features.append(feature)
+            print(f"  [SKIP] {feature} has fewer than 2 valid groups (groups: {list(unique_groups)}).")
+            continue
+
+        group_order = [g for g in ["correct", "wrong"] if g in unique_groups]
+
+        # --- try/except per feature ---
+        try:
+            plt.figure(figsize=(6.5, 4.5), dpi=150)
+            if sns is not None:
+                sns.boxplot(
+                    data=plot_df,
+                    x="correct_group",
+                    y=feature,
+                    order=group_order,
+                    color="#86a873",
+                )
+                sns.stripplot(
+                    data=plot_df,
+                    x="correct_group",
+                    y=feature,
+                    order=group_order,
+                    color="#2f2f2f",
+                    size=2,
+                    alpha=0.35,
+                )
+            else:
+                plot_df.boxplot(column=feature, by="correct_group", grid=False)
+                plt.suptitle("")
+            plt.title(f"{feature}: correct vs wrong")
+            plt.xlabel("Prediction result")
+            plt.ylabel(feature)
+            plt.tight_layout()
+            output = figure_dir / filename
+            plt.savefig(output)
+            plt.close()
+            outputs.append(output)
+            print(f"  [OK] saved: {output}")
+        except Exception as exc:
+            plt.close("all")
+            failed_features.append(feature)
+            print(f"  [FAIL] {feature} plotting raised {type(exc).__name__}: {exc}")
+
+    # Write failed features log
+    if failed_features:
+        failed_log = report_dir / "merge_plot_failed_features.txt"
+        failed_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(failed_log, "w", encoding="utf-8") as f:
+            for feat in failed_features:
+                f.write(feat + "\n")
+        print(f"  Failed features written to: {failed_log}")
+
+    return outputs, failed_features, skipped_features
 
 def main() -> None:
     args = parse_args()
@@ -287,10 +353,22 @@ def main() -> None:
         return
 
     summary_path = save_correct_wrong_summary(merged, report_dir)
-    plot_paths = save_correct_wrong_plots(merged, figure_dir)
-    print("Correct vs wrong summary:", summary_path)
-    print("Correct vs wrong figures:", len(plot_paths), "files saved to", figure_dir)
+    plot_paths, failed_features, skipped_features = save_correct_wrong_plots(merged, figure_dir, report_dir)
 
+    success_count = len(plot_paths)
+    skip_count = len(skipped_features)
+    fail_count = len(failed_features)
+
+    print("=" * 50)
+    print("Correct-vs-wrong plots saved:", success_count)
+    print("Skipped/failed plots:", skip_count + fail_count)
+    print("Correct vs wrong summary:", summary_path)
+    print("Merged CSV:", output_csv)
+    print("Summary CSV:", summary_path)
+    if success_count > 0:
+        print("Figures saved to:", figure_dir)
+    print("=" * 50)
 
 if __name__ == "__main__":
     main()
+
